@@ -9,7 +9,6 @@ const R: f64 = 8.314;
 #[derive(Clone, Debug, PartialEq)]
 struct Substance {
     name: String,
-    is_gas: bool,
     molar_mass: f64,
     boiling_point: f64,
     density: f64,
@@ -30,12 +29,14 @@ struct Particle {
     pos: egui::Pos2,
     dir: egui::Vec2,
     substance_idx: usize,
+    is_gas: bool,
 }
 
 #[derive(Clone)]
 struct SpawnedEntity {
     substance_idx: usize,
-    moles: f64,
+    gas_moles: f64,
+    liquid_moles: f64,
 }
 
 struct GasWorksApp {
@@ -94,6 +95,7 @@ impl eframe::App for GasWorksApp {
         if !self.exploded {
             self.time += dt as f64;
             self.update_thermodynamics(dt as f64);
+            self.sync_particles();
             self.update_physics(dt);
             self.check_chemical_reactions();
             self.record_history();
@@ -105,6 +107,7 @@ impl eframe::App for GasWorksApp {
         self.window_graphs(ctx);
         self.window_spawner(ctx);
         self.window_viewport(ctx);
+        self.window_substance_info(ctx);
 
         ctx.request_repaint();
     }
@@ -115,13 +118,11 @@ impl GasWorksApp {
         let mut p_total = 0.0;
         for entity in &self.entities {
             let sub = &self.database[entity.substance_idx];
-            if sub.is_gas || self.temperature >= sub.boiling_point {
-                let n = entity.moles;
-                if n > 0.0 {
-                    let vdw_term1 = (n * R * self.temperature) / (self.volume - n * sub.vdw_b).max(0.001);
-                    let vdw_term2 = (sub.vdw_a * n * n) / (self.volume * self.volume);
-                    p_total += (vdw_term1 - vdw_term2).max(0.0);
-                }
+            let n = entity.gas_moles;
+            if n > 0.0 {
+                let vdw_term1 = (n * R * self.temperature) / (self.volume - n * sub.vdw_b).max(0.001);
+                let vdw_term2 = (sub.vdw_a * n * n) / (self.volume * self.volume);
+                p_total += (vdw_term1 - vdw_term2).max(0.0);
             }
         }
         p_total
@@ -131,7 +132,7 @@ impl GasWorksApp {
         let mut total_heat_capacity = 0.0;
         for entity in &self.entities {
             let sub = &self.database[entity.substance_idx];
-            let mass = entity.moles * sub.molar_mass;
+            let mass = (entity.gas_moles + entity.liquid_moles) * sub.molar_mass;
             total_heat_capacity += mass * sub.heat_capacity;
         }
         if total_heat_capacity < 1.0 { total_heat_capacity = 1.0; }
@@ -139,18 +140,30 @@ impl GasWorksApp {
         let heat_exchange = self.heat_transfer_coeff * (self.ambient_temp - self.temperature) * dt;
         self.temperature += heat_exchange / total_heat_capacity;
 
+        let conversion_rate = 0.8;
+        for entity in &mut self.entities {
+            let sub = &self.database[entity.substance_idx];
+            if self.temperature > sub.boiling_point {
+                let diff = self.temperature - sub.boiling_point;
+                let convert = (diff * conversion_rate * dt).min(entity.liquid_moles);
+                entity.liquid_moles -= convert;
+                entity.gas_moles += convert;
+            } else {
+                let diff = sub.boiling_point - self.temperature;
+                let convert = (diff * conversion_rate * dt).min(entity.gas_moles);
+                entity.gas_moles -= convert;
+                entity.liquid_moles += convert;
+            }
+        }
+
         if self.valve_open {
             let p_in = self.calculate_pressure();
             if p_in > self.ambient_pressure {
-                let drop_ratio = 1.0 - (0.15 * dt);
+                let drop_ratio = 1.0 - (5.5 * dt);
                 for entity in &mut self.entities {
-                    let sub = &self.database[entity.substance_idx];
-                    if sub.is_gas || self.temperature >= sub.boiling_point {
-                        entity.moles *= drop_ratio;
-                    }
+                    entity.gas_moles = (entity.gas_moles * drop_ratio).max(0.0);
                 }
-                let mut rng = rand::thread_rng();
-                self.particles.retain(|_| rng.gen_range(0.0..1.0) < drop_ratio);
+                self.entities.retain(|e| (e.gas_moles + e.liquid_moles) > 0.001);
             }
         }
 
@@ -160,17 +173,122 @@ impl GasWorksApp {
         }
     }
 
+    fn sync_particles(&mut self) {
+        let mut rng = rand::thread_rng();
+
+        for (idx, _) in self.database.iter().enumerate() {
+            let (gas_moles, liq_moles) = self.entities.iter()
+                .find(|e| e.substance_idx == idx)
+                .map(|e| (e.gas_moles, e.liquid_moles))
+                .unwrap_or((0.0, 0.0));
+
+            let target_gas = (gas_moles * 15.0) as usize;
+            let target_liq = (liq_moles * 15.0) as usize;
+
+            let mut p_gas = Vec::new();
+            let mut p_liq = Vec::new();
+            for (p_i, p) in self.particles.iter().enumerate() {
+                if p.substance_idx == idx {
+                    if p.is_gas { p_gas.push(p_i); } else { p_liq.push(p_i); }
+                }
+            }
+
+            let mut curr_gas = p_gas.len();
+            let mut curr_liq = p_liq.len();
+
+            while curr_gas < target_gas && curr_liq > target_liq {
+                if let Some(&p_i) = p_liq.last() {
+                    self.particles[p_i].is_gas = true;
+                    self.particles[p_i].dir = egui::vec2(rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..0.0)).normalized();
+                    p_gas.push(p_i);
+                    p_liq.pop();
+                    curr_gas += 1;
+                    curr_liq -= 1;
+                } else { break; }
+            }
+
+            while curr_liq < target_liq && curr_gas > target_gas {
+                if let Some(&p_i) = p_gas.last() {
+                    self.particles[p_i].is_gas = false;
+                    self.particles[p_i].dir = egui::vec2(rng.gen_range(-1.0..1.0), 0.0);
+                    p_liq.push(p_i);
+                    p_gas.pop();
+                    curr_liq += 1;
+                    curr_gas -= 1;
+                } else { break; }
+            }
+
+            while curr_gas < target_gas {
+                let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                self.particles.push(Particle {
+                    pos: egui::pos2(rng.gen_range(0.1..0.9), rng.gen_range(0.1..0.5)),
+                    dir: egui::vec2(angle.cos(), angle.sin()),
+                    substance_idx: idx,
+                    is_gas: true,
+                });
+                curr_gas += 1;
+            }
+
+            while curr_liq < target_liq {
+                self.particles.push(Particle {
+                    pos: egui::pos2(rng.gen_range(0.1..0.9), rng.gen_range(0.8..0.9)),
+                    dir: egui::vec2(rng.gen_range(-1.0..1.0), 0.0),
+                    substance_idx: idx,
+                    is_gas: false,
+                });
+                curr_liq += 1;
+            }
+        }
+
+        for idx in 0..self.database.len() {
+            let (gas_moles, liq_moles) = self.entities.iter()
+                .find(|e| e.substance_idx == idx)
+                .map(|e| (e.gas_moles, e.liquid_moles))
+                .unwrap_or((0.0, 0.0));
+            let target_gas = (gas_moles * 15.0) as usize;
+            let target_liq = (liq_moles * 15.0) as usize;
+
+            let mut c_g = 0;
+            let mut c_l = 0;
+            self.particles.retain(|p| {
+                if p.substance_idx == idx {
+                    if p.is_gas {
+                        if c_g < target_gas { c_g += 1; true } else { false }
+                    } else {
+                        if c_l < target_liq { c_l += 1; true } else { false }
+                    }
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
     fn update_physics(&mut self, dt: f32) {
         let mut rng = rand::thread_rng();
 
+        let mut active_liquids: Vec<(usize, f64, f64)> = self.entities.iter()
+            .filter(|e| e.liquid_moles > 0.001)
+            .map(|e| (e.substance_idx, e.liquid_moles, self.database[e.substance_idx].density))
+            .collect();
+
+        active_liquids.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+        let mut layers = std::collections::HashMap::new();
+        let mut current_y = 1.0;
+
+        for (idx, moles, _) in active_liquids {
+            let height = (moles * 0.004).min(0.2) as f32;
+            layers.insert(idx, (current_y - height, current_y));
+            current_y -= height;
+        }
+
         for particle in &mut self.particles {
             let sub = &self.database[particle.substance_idx];
-            let is_gas = sub.is_gas || self.temperature >= sub.boiling_point;
 
-            if is_gas {
+            if particle.is_gas {
                 let v_rms = ((3.0 * R * self.temperature) / sub.molar_mass).sqrt();
                 let speed_scale = (v_rms * 0.00015) as f32;
-
                 particle.pos += particle.dir * speed_scale * dt;
 
                 if particle.pos.x <= 0.0 { particle.pos.x = 0.0; particle.dir.x *= -1.0; }
@@ -178,12 +296,16 @@ impl GasWorksApp {
                 if particle.pos.y <= 0.0 { particle.pos.y = 0.0; particle.dir.y *= -1.0; }
                 if particle.pos.y >= 1.0 { particle.pos.y = 1.0; particle.dir.y *= -1.0; }
             } else {
-                particle.pos.y += 0.35 * dt;
-                if particle.pos.y > 0.96 {
-                    particle.pos.y = rng.gen_range(0.94..=0.98);
+                if let Some(&(top, bottom)) = layers.get(&particle.substance_idx) {
+                    let target_y = rng.gen_range(top..bottom);
+                    let dy = target_y - particle.pos.y;
+
+                    particle.pos.y += dy * 3.0 * dt;
+                    particle.pos.x += particle.dir.x * 0.08 * dt;
+
+                    if particle.pos.x <= 0.0 { particle.pos.x = 0.0; particle.dir.x *= -1.0; }
+                    if particle.pos.x >= 1.0 { particle.pos.x = 1.0; particle.dir.x *= -1.0; }
                 }
-                particle.pos.x += particle.dir.x * 0.05 * dt;
-                if particle.pos.x <= 0.0 || particle.pos.x >= 1.0 { particle.dir.x *= -1.0; }
             }
         }
     }
@@ -204,7 +326,7 @@ impl GasWorksApp {
                 for (idx, coef) in &reaction.reactants {
                     let mut available = 0.0;
                     for e in &self.entities {
-                        if e.substance_idx == *idx { available += e.moles; }
+                        if e.substance_idx == *idx { available += e.gas_moles + e.liquid_moles; }
                     }
                     if available < *coef * 0.01 {
                         can_react = false;
@@ -232,17 +354,15 @@ impl GasWorksApp {
 
         for (idx, amount) in to_consume {
             self.consume_substance(idx, amount);
-            self.remove_particles(idx, amount);
         }
         for (idx, amount) in to_produce {
             self.add_substance_moles(idx, amount);
-            self.spawn_particles(idx, amount);
         }
 
         let mut total_heat_capacity = 0.0;
         for entity in &self.entities {
             let sub = &self.database[entity.substance_idx];
-            total_heat_capacity += entity.moles * sub.molar_mass * sub.heat_capacity;
+            total_heat_capacity += (entity.gas_moles + entity.liquid_moles) * sub.molar_mass * sub.heat_capacity;
         }
         if total_heat_capacity > 1.0 && total_heat_change != 0.0 {
             self.temperature += total_heat_change / total_heat_capacity;
@@ -255,43 +375,28 @@ impl GasWorksApp {
 
     fn consume_substance(&mut self, idx: usize, amount: f64) {
         if let Some(entity) = self.entities.iter_mut().find(|e| e.substance_idx == idx) {
-            entity.moles -= amount;
-            if entity.moles < 0.0 { entity.moles = 0.0; }
+            let mut remaining = amount;
+            if entity.gas_moles > 0.0 {
+                let take = remaining.min(entity.gas_moles);
+                entity.gas_moles -= take;
+                remaining -= take;
+            }
+            if remaining > 0.0 {
+                entity.liquid_moles -= remaining;
+                if entity.liquid_moles < 0.0 { entity.liquid_moles = 0.0; }
+            }
         }
-        self.entities.retain(|e| e.moles > 0.001);
+        self.entities.retain(|e| (e.gas_moles + e.liquid_moles) > 0.001);
     }
 
     fn add_substance_moles(&mut self, idx: usize, amount: f64) {
+        let is_gas = self.temperature >= self.database[idx].boiling_point;
         if let Some(entity) = self.entities.iter_mut().find(|e| e.substance_idx == idx) {
-            entity.moles += amount;
+            if is_gas { entity.gas_moles += amount; } else { entity.liquid_moles += amount; }
         } else {
-            self.entities.push(SpawnedEntity { substance_idx: idx, moles: amount });
-        }
-    }
-
-    fn remove_particles(&mut self, idx: usize, moles: f64) {
-        let to_remove = (moles * 15.0) as usize;
-        let mut removed = 0;
-        self.particles.retain(|p| {
-            if p.substance_idx == idx && removed < to_remove {
-                removed += 1;
-                false
-            } else {
-                true
-            }
-        });
-    }
-
-    fn spawn_particles(&mut self, idx: usize, moles: f64) {
-        let mut rng = rand::thread_rng();
-        let to_add = (moles * 15.0) as usize;
-        for _ in 0..to_add {
-            let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-            self.particles.push(Particle {
-                pos: egui::pos2(rng.gen_range(0.2..0.8), rng.gen_range(0.2..0.8)),
-                dir: egui::vec2(angle.cos(), angle.sin()),
-                substance_idx: idx,
-            });
+            let mut e = SpawnedEntity { substance_idx: idx, gas_moles: 0.0, liquid_moles: 0.0 };
+            if is_gas { e.gas_moles = amount; } else { e.liquid_moles = amount; }
+            self.entities.push(e);
         }
     }
 
@@ -310,7 +415,7 @@ impl GasWorksApp {
             }
             ui.add(egui::Slider::new(&mut self.volume, 0.1..=15.0).text("Объем камеры (м^3)"));
             ui.add(egui::Slider::new(&mut self.heat_transfer_coeff, 0.0..=40.0).text("Теплопроводность стенок"));
-            ui.add(egui::Slider::new(&mut self.ambient_temp, 50.0..=1200.0).text("Внешняя темп. (K)"));
+            ui.add(egui::Slider::new(&mut self.ambient_temp, 5.0..=1200.0).text("Внешняя темп. (K)"));
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -340,11 +445,11 @@ impl GasWorksApp {
             let warn_vacuum = p < 4000.0 && !self.entities.is_empty();
             let warn_temp = t > 773.15;
 
-            Self::draw_lamp(ui, warn_pressure, egui::Color32::RED, "КРИТИЧЕСКОЕ ДАВЛЕНИЕ (ОПАСНОСТЬ ВЗРЫВА)");
-            Self::draw_lamp(ui, warn_vacuum, egui::Color32::LIGHT_BLUE, "ПОНИЖЕННОЕ ДАВЛЕНИЕ / ВАКУУМ");
-            Self::draw_lamp(ui, warn_temp, egui::Color32::from_rgb(255, 69, 0), "ТЕРМИЧЕСКАЯ АКТИВАЦИЯ СРЕДЫ");
-            Self::draw_lamp(ui, self.valve_open, egui::Color32::YELLOW, "СБРОС МАССЫ ЧЕРЕЗ КЛАПАН");
-            Self::draw_lamp(ui, self.exploded, egui::Color32::RED, "ПОВРЕЖДЕНИЕ КОРПУСА РЕАКТОРА");
+            Self::draw_lamp(ui, warn_pressure, egui::Color32::RED, "КРИТИЧЕСКОЕ ДАВЛЕНИЕ");
+            Self::draw_lamp(ui, warn_vacuum, egui::Color32::LIGHT_BLUE, "ВАКУУМ");
+            Self::draw_lamp(ui, warn_temp, egui::Color32::from_rgb(255, 69, 0), "ТЕРМИЧЕСКАЯ АКТИВАЦИЯ");
+            Self::draw_lamp(ui, self.valve_open, egui::Color32::YELLOW, "СБРОС МАССЫ");
+            Self::draw_lamp(ui, self.exploded, egui::Color32::RED, "ПОВРЕЖДЕНИЕ КОРПУСА");
         });
     }
 
@@ -357,30 +462,28 @@ impl GasWorksApp {
             ui.heading("Содержимое:");
             for e in &self.entities {
                 let sub = &self.database[e.substance_idx];
-                let is_gas = sub.is_gas || self.temperature >= sub.boiling_point;
-                let state_str = if is_gas { "Газообразное" } else { "Конденсат" };
-                ui.label(format!("• {}: {:.2} моль [{}]", sub.name, e.moles, state_str));
+                ui.label(format!("• {}:", sub.name));
+                if e.gas_moles > 0.001 { ui.label(format!("  - Газ: {:.2} моль", e.gas_moles)); }
+                if e.liquid_moles > 0.001 { ui.label(format!("  - Жидкость: {:.2} моль", e.liquid_moles)); }
             }
         });
     }
 
     fn window_graphs(&mut self, ctx: &egui::Context) {
-        egui::Window::new("4. Мониторинг параметров").show(ctx, |ui| {
-            ui.label("Динамика давления (Pa):");
+        egui::Window::new("4. Мониторинг").show(ctx, |ui| {
             let line_p = Line::new(PlotPoints::from_iter(self.history_p.clone())).color(egui::Color32::from_rgb(0, 191, 255));
             Plot::new("plot_p_complex").height(130.0).show(ui, |plot_ui| plot_ui.line(line_p));
 
-            ui.label("Динамика температуры (K):");
             let line_t = Line::new(PlotPoints::from_iter(self.history_t.clone())).color(egui::Color32::from_rgb(255, 99, 71));
             Plot::new("plot_t_complex").height(130.0).show(ui, |plot_ui| plot_ui.line(line_t));
         });
     }
 
     fn window_spawner(&mut self, ctx: &egui::Context) {
-        egui::Window::new("5. Шлюз загрузки веществ").show(ctx, |ui| {
+        egui::Window::new("5. Шлюз").show(ctx, |ui| {
             ui.add(egui::Slider::new(&mut self.spawn_amount_moles, 0.2..=20.0).text("Количество (моль)"));
 
-            egui::ComboBox::from_label("Активное вещество")
+            egui::ComboBox::from_label("")
                 .selected_text(&self.database[self.selected_substance].name)
                 .show_ui(ui, |ui| {
                     for (i, sub) in self.database.iter().enumerate() {
@@ -390,11 +493,10 @@ impl GasWorksApp {
 
             ui.add_space(5.0);
             ui.horizontal(|ui| {
-                if ui.button("📥 Закачать в камеру").clicked() {
+                if ui.button("📥 Закачать").clicked() {
                     self.add_substance_moles(self.selected_substance, self.spawn_amount_moles);
-                    self.spawn_particles(self.selected_substance, self.spawn_amount_moles);
                 }
-                if ui.button("🧹 Полная очистка").clicked() {
+                if ui.button("🧹 Очистка").clicked() {
                     self.entities.clear();
                     self.particles.clear();
                 }
@@ -403,7 +505,7 @@ impl GasWorksApp {
     }
 
     fn window_viewport(&mut self, ctx: &egui::Context) {
-        egui::Window::new("6. Смотровое окно реактора").show(ctx, |ui| {
+        egui::Window::new("6. Камера").show(ctx, |ui| {
             let (response, painter) = ui.allocate_painter(egui::vec2(450.0, 420.0), egui::Sense::hover());
             let rect = response.rect;
 
@@ -427,6 +529,24 @@ impl GasWorksApp {
             }
         });
     }
+
+    fn window_substance_info(&mut self, ctx: &egui::Context) {
+        egui::Window::new("7. Константы веществ").show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for sub in &self.database {
+                    ui.collapsing(&sub.name, |ui| {
+                        ui.label(format!("M: {:.4} кг/моль", sub.molar_mass));
+                        ui.label(format!("T_boil: {:.2} K", sub.boiling_point));
+                        ui.label(format!("ρ_liq: {:.1} кг/м³", sub.density));
+                        ui.label(format!("C: {:.1} Дж/(кг·K)", sub.heat_capacity));
+                        ui.label(format!("vdw_a: {:.4} Па·м⁶/моль²", sub.vdw_a));
+                        ui.label(format!("vdw_b: {:.6} м³/моль", sub.vdw_b));
+                        ui.label(format!("L: {:.1} Дж/моль", sub.latent_heat));
+                    });
+                }
+            });
+        });
+    }
 }
 
 fn get_substance_color(name: &str) -> egui::Color32 {
@@ -438,57 +558,100 @@ fn get_substance_color(name: &str) -> egui::Color32 {
 
 fn build_substance_database() -> Vec<Substance> {
     vec![
-        // === ГАЗЫ ===
-        Substance { name: "Водород (H2)".into(), is_gas: true, molar_mass: 0.002016, boiling_point: 20.28, density: 0.089, heat_capacity: 14300.0, vdw_a: 0.0248, vdw_b: 0.0000266, latent_heat: 900.0 },
-        Substance { name: "Гелий (He)".into(), is_gas: true, molar_mass: 0.004002, boiling_point: 4.22, density: 0.1786, heat_capacity: 5193.0, vdw_a: 0.0035, vdw_b: 0.0000237, latent_heat: 80.0 },
-        Substance { name: "Азот (N2)".into(), is_gas: true, molar_mass: 0.02801, boiling_point: 77.36, density: 1.2506, heat_capacity: 1040.0, vdw_a: 0.1370, vdw_b: 0.0000386, latent_heat: 5560.0 },
-        Substance { name: "Кислород (O2)".into(), is_gas: true, molar_mass: 0.032, boiling_point: 90.20, density: 1.429, heat_capacity: 918.0, vdw_a: 0.1378, vdw_b: 0.0000318, latent_heat: 6820.0 },
-        Substance { name: "Фтор (F2)".into(), is_gas: true, molar_mass: 0.038, boiling_point: 85.03, density: 1.696, heat_capacity: 824.0, vdw_a: 0.1160, vdw_b: 0.0000290, latent_heat: 6500.0 },
-        Substance { name: "Неон (Ne)".into(), is_gas: true, molar_mass: 0.02018, boiling_point: 27.07, density: 0.9002, heat_capacity: 1030.0, vdw_a: 0.0210, vdw_b: 0.0000171, latent_heat: 440.0 },
-        Substance { name: "Хлор (Cl2)".into(), is_gas: true, molar_mass: 0.0709, boiling_point: 239.11, density: 3.2, heat_capacity: 480.0, vdw_a: 0.6580, vdw_b: 0.0000562, latent_heat: 20400.0 },
-        Substance { name: "Аргон (Ar)".into(), is_gas: true, molar_mass: 0.03995, boiling_point: 87.30, density: 1.784, heat_capacity: 520.0, vdw_a: 0.1350, vdw_b: 0.0000322, latent_heat: 6500.0 },
-        Substance { name: "Криптон (Kr)".into(), is_gas: true, molar_mass: 0.08379, boiling_point: 119.93, density: 3.749, heat_capacity: 248.0, vdw_a: 0.2350, vdw_b: 0.0000398, latent_heat: 9080.0 },
-        Substance { name: "Ксенон (Xe)".into(), is_gas: true, molar_mass: 0.13129, boiling_point: 165.03, density: 5.894, heat_capacity: 158.0, vdw_a: 0.4190, vdw_b: 0.0000511, latent_heat: 12640.0 },
-        Substance { name: "Радон (Rn)".into(), is_gas: true, molar_mass: 0.222, boiling_point: 211.3, density: 9.73, heat_capacity: 94.0, vdw_a: 0.6300, vdw_b: 0.0000620, latent_heat: 18100.0 },
-        Substance { name: "Угарный газ (CO)".into(), is_gas: true, molar_mass: 0.02801, boiling_point: 81.65, density: 1.145, heat_capacity: 1040.0, vdw_a: 0.1470, vdw_b: 0.0000395, latent_heat: 6040.0 },
-        Substance { name: "Углекислый газ (CO2)".into(), is_gas: true, molar_mass: 0.04401, boiling_point: 194.65, density: 1.977, heat_capacity: 844.0, vdw_a: 0.3640, vdw_b: 0.0000427, latent_heat: 25200.0 },
-        Substance { name: "Метан (CH4)".into(), is_gas: true, molar_mass: 0.01604, boiling_point: 111.6, density: 0.717, heat_capacity: 2220.0, vdw_a: 0.2283, vdw_b: 0.0000428, latent_heat: 8170.0 },
-        Substance { name: "Этан (C2H6)".into(), is_gas: true, molar_mass: 0.03007, boiling_point: 184.5, density: 1.356, heat_capacity: 1760.0, vdw_a: 0.5560, vdw_b: 0.0000638, latent_heat: 14700.0 },
-        Substance { name: "Пропан (C3H8)".into(), is_gas: true, molar_mass: 0.0441, boiling_point: 231.1, density: 2.01, heat_capacity: 1670.0, vdw_a: 0.9390, vdw_b: 0.0000905, latent_heat: 18800.0 },
-        Substance { name: "Бутан (C4H10)".into(), is_gas: true, molar_mass: 0.05812, boiling_point: 272.2, density: 2.48, heat_capacity: 1670.0, vdw_a: 1.4660, vdw_b: 0.0001226, latent_heat: 22400.0 },
-        Substance { name: "Аммиак (NH3)".into(), is_gas: true, molar_mass: 0.01703, boiling_point: 239.8, density: 0.769, heat_capacity: 2190.0, vdw_a: 0.4230, vdw_b: 0.0000373, latent_heat: 23350.0 },
-        Substance { name: "Диоксид серы (SO2)".into(), is_gas: true, molar_mass: 0.06406, boiling_point: 263.1, density: 2.926, heat_capacity: 620.0, vdw_a: 0.6800, vdw_b: 0.0000564, latent_heat: 24900.0 },
-        Substance { name: "Диоксид азота (NO2)".into(), is_gas: true, molar_mass: 0.04601, boiling_point: 294.3, density: 1.88, heat_capacity: 810.0, vdw_a: 0.5300, vdw_b: 0.0000440, latent_heat: 38000.0 },
-
-        // === ЖИДКОСТИ ===
-        Substance { name: "Вода (H2O)".into(), is_gas: false, molar_mass: 0.01801, boiling_point: 373.15, density: 997.0, heat_capacity: 4184.0, vdw_a: 0.5536, vdw_b: 0.0000305, latent_heat: 40650.0 },
-        Substance { name: "Этанол (C2H5OH)".into(), is_gas: false, molar_mass: 0.04607, boiling_point: 351.39, density: 789.0, heat_capacity: 2440.0, vdw_a: 1.2180, vdw_b: 0.0000841, latent_heat: 38600.0 },
-        Substance { name: "Метанол (CH3OH)".into(), is_gas: false, molar_mass: 0.03204, boiling_point: 337.8, density: 792.0, heat_capacity: 2530.0, vdw_a: 0.9650, vdw_b: 0.0000659, latent_heat: 35300.0 },
-        Substance { name: "Изопропанол (C3H8O)".into(), is_gas: false, molar_mass: 0.0601, boiling_point: 355.6, density: 786.0, heat_capacity: 2680.0, vdw_a: 1.5000, vdw_b: 0.0001100, latent_heat: 40000.0 },
-        Substance { name: "Ацетон (C3H6O)".into(), is_gas: false, molar_mass: 0.05808, boiling_point: 329.2, density: 790.0, heat_capacity: 2150.0, vdw_a: 1.6000, vdw_b: 0.0001100, latent_heat: 29100.0 },
-        Substance { name: "Глицерин (C3H8O3)".into(), is_gas: false, molar_mass: 0.09209, boiling_point: 563.0, density: 1261.0, heat_capacity: 2400.0, vdw_a: 2.0000, vdw_b: 0.0001400, latent_heat: 61000.0 },
-        Substance { name: "Ртуть (Hg)".into(), is_gas: false, molar_mass: 0.20059, boiling_point: 629.88, density: 13534.0, heat_capacity: 140.0, vdw_a: 0.8190, vdw_b: 0.0000170, latent_heat: 59100.0 },
-        Substance { name: "Бром (Br2)".into(), is_gas: false, molar_mass: 0.1598, boiling_point: 331.9, density: 3102.8, heat_capacity: 470.0, vdw_a: 1.0000, vdw_b: 0.0000700, latent_heat: 29900.0 },
-        Substance { name: "Гексан (C6H14)".into(), is_gas: false, molar_mass: 0.08618, boiling_point: 341.8, density: 654.8, heat_capacity: 2260.0, vdw_a: 2.4700, vdw_b: 0.0001700, latent_heat: 28900.0 },
-        Substance { name: "Октан (C8H18)".into(), is_gas: false, molar_mass: 0.11423, boiling_point: 398.8, density: 703.0, heat_capacity: 2230.0, vdw_a: 3.7600, vdw_b: 0.0002400, latent_heat: 34400.0 },
+        Substance { name: "Водород (H2)".into(), molar_mass: 0.002016, boiling_point: 20.28, density: 0.089, heat_capacity: 14300.0, vdw_a: 0.0248, vdw_b: 0.0000266, latent_heat: 900.0 },
+        Substance { name: "Гелий (He)".into(), molar_mass: 0.004002, boiling_point: 4.22, density: 0.1786, heat_capacity: 5193.0, vdw_a: 0.0035, vdw_b: 0.0000237, latent_heat: 80.0 },
+        Substance { name: "Азот (N2)".into(), molar_mass: 0.02801, boiling_point: 77.36, density: 808.0, heat_capacity: 1040.0, vdw_a: 0.1370, vdw_b: 0.0000386, latent_heat: 5560.0 },
+        Substance { name: "Кислород (O2)".into(), molar_mass: 0.032, boiling_point: 90.20, density: 1141.0, heat_capacity: 918.0, vdw_a: 0.1378, vdw_b: 0.0000318, latent_heat: 6820.0 },
+        Substance { name: "Фтор (F2)".into(), molar_mass: 0.038, boiling_point: 85.03, density: 1505.0, heat_capacity: 824.0, vdw_a: 0.1160, vdw_b: 0.0000290, latent_heat: 6500.0 },
+        Substance { name: "Неон (Ne)".into(), molar_mass: 0.02018, boiling_point: 27.07, density: 1207.0, heat_capacity: 1030.0, vdw_a: 0.0210, vdw_b: 0.0000171, latent_heat: 440.0 },
+        Substance { name: "Хлор (Cl2)".into(), molar_mass: 0.0709, boiling_point: 239.11, density: 1562.0, heat_capacity: 480.0, vdw_a: 0.6580, vdw_b: 0.0000562, latent_heat: 20400.0 },
+        Substance { name: "Аргон (Ar)".into(), molar_mass: 0.03995, boiling_point: 87.30, density: 1395.0, heat_capacity: 520.0, vdw_a: 0.1350, vdw_b: 0.0000322, latent_heat: 6500.0 },
+        Substance { name: "Криптон (Kr)".into(), molar_mass: 0.08379, boiling_point: 119.93, density: 2413.0, heat_capacity: 248.0, vdw_a: 0.2350, vdw_b: 0.0000398, latent_heat: 9080.0 },
+        Substance { name: "Ксенон (Xe)".into(), molar_mass: 0.13129, boiling_point: 165.03, density: 2942.0, heat_capacity: 158.0, vdw_a: 0.4190, vdw_b: 0.0000511, latent_heat: 12640.0 },
+        Substance { name: "Радон (Rn)".into(), molar_mass: 0.222, boiling_point: 211.3, density: 4400.0, heat_capacity: 94.0, vdw_a: 0.6300, vdw_b: 0.0000620, latent_heat: 18100.0 },
+        Substance { name: "Угарный газ (CO)".into(), molar_mass: 0.02801, boiling_point: 81.65, density: 789.0, heat_capacity: 1040.0, vdw_a: 0.1470, vdw_b: 0.0000395, latent_heat: 6040.0 },
+        Substance { name: "Углекислый газ (CO2)".into(), molar_mass: 0.04401, boiling_point: 194.65, density: 1562.0, heat_capacity: 844.0, vdw_a: 0.3640, vdw_b: 0.0000427, latent_heat: 25200.0 },
+        Substance { name: "Метан (CH4)".into(), molar_mass: 0.01604, boiling_point: 111.6, density: 422.0, heat_capacity: 2220.0, vdw_a: 0.2283, vdw_b: 0.0000428, latent_heat: 8170.0 },
+        Substance { name: "Этан (C2H6)".into(), molar_mass: 0.03007, boiling_point: 184.5, density: 544.0, heat_capacity: 1760.0, vdw_a: 0.5560, vdw_b: 0.0000638, latent_heat: 14700.0 },
+        Substance { name: "Пропан (C3H8)".into(), molar_mass: 0.0441, boiling_point: 231.1, density: 582.0, heat_capacity: 1670.0, vdw_a: 0.9390, vdw_b: 0.0000905, latent_heat: 18800.0 },
+        Substance { name: "Бутан (C4H10)".into(), molar_mass: 0.05812, boiling_point: 272.2, density: 600.0, heat_capacity: 1670.0, vdw_a: 1.4660, vdw_b: 0.0001226, latent_heat: 22400.0 },
+        Substance { name: "Аммиак (NH3)".into(), molar_mass: 0.01703, boiling_point: 239.8, density: 681.0, heat_capacity: 2190.0, vdw_a: 0.4230, vdw_b: 0.0000373, latent_heat: 23350.0 },
+        Substance { name: "Диоксид серы (SO2)".into(), molar_mass: 0.06406, boiling_point: 263.1, density: 1460.0, heat_capacity: 620.0, vdw_a: 0.6800, vdw_b: 0.0000564, latent_heat: 24900.0 },
+        Substance { name: "Диоксид азота (NO2)".into(), molar_mass: 0.04601, boiling_point: 294.3, density: 1449.0, heat_capacity: 810.0, vdw_a: 0.5300, vdw_b: 0.0000440, latent_heat: 38000.0 },
+        Substance { name: "Вода (H2O)".into(), molar_mass: 0.01801, boiling_point: 373.15, density: 997.0, heat_capacity: 4184.0, vdw_a: 0.5536, vdw_b: 0.0000305, latent_heat: 40650.0 },
+        Substance { name: "Этанол (C2H5OH)".into(), molar_mass: 0.04607, boiling_point: 351.39, density: 789.0, heat_capacity: 2440.0, vdw_a: 1.2180, vdw_b: 0.0000841, latent_heat: 38600.0 },
+        Substance { name: "Метанол (CH3OH)".into(), molar_mass: 0.03204, boiling_point: 337.8, density: 792.0, heat_capacity: 2530.0, vdw_a: 0.9650, vdw_b: 0.0000659, latent_heat: 35300.0 },
+        Substance { name: "Изопропанол (C3H8O)".into(), molar_mass: 0.0601, boiling_point: 355.6, density: 786.0, heat_capacity: 2680.0, vdw_a: 1.5000, vdw_b: 0.0001100, latent_heat: 40000.0 },
+        Substance { name: "Ацетон (C3H6O)".into(), molar_mass: 0.05808, boiling_point: 329.2, density: 790.0, heat_capacity: 2150.0, vdw_a: 1.6000, vdw_b: 0.0001100, latent_heat: 29100.0 },
+        Substance { name: "Глицерин (C3H8O3)".into(), molar_mass: 0.09209, boiling_point: 563.0, density: 1261.0, heat_capacity: 2400.0, vdw_a: 2.0000, vdw_b: 0.0001400, latent_heat: 61000.0 },
+        Substance { name: "Ртуть (Hg)".into(), molar_mass: 0.20059, boiling_point: 629.88, density: 13534.0, heat_capacity: 140.0, vdw_a: 0.8190, vdw_b: 0.0000170, latent_heat: 59100.0 },
+        Substance { name: "Бром (Br2)".into(), molar_mass: 0.1598, boiling_point: 331.9, density: 3102.8, heat_capacity: 470.0, vdw_a: 1.0000, vdw_b: 0.0000700, latent_heat: 29900.0 },
+        Substance { name: "Гексан (C6H14)".into(), molar_mass: 0.08618, boiling_point: 341.8, density: 654.8, heat_capacity: 2260.0, vdw_a: 2.4700, vdw_b: 0.0001700, latent_heat: 28900.0 },
+        Substance { name: "Октан (C8H18)".into(), molar_mass: 0.11423, boiling_point: 398.8, density: 703.0, heat_capacity: 2230.0, vdw_a: 3.7600, vdw_b: 0.0002400, latent_heat: 34400.0 },
     ]
 }
 
 fn build_reactions() -> Vec<Reaction> {
     vec![
-        // Горение водорода: 2 H2 + O2 -> 2 H2O
         Reaction {
             reactants: vec![(0, 2.0), (3, 1.0)],
             products: vec![(20, 2.0)],
             activation_temp: 773.15,
             enthalpy_change: 483600.0,
         },
-        // Горение метана: CH4 + 2 O2 -> CO2 + 2 H2O
         Reaction {
             reactants: vec![(13, 1.0), (3, 2.0)],
             products: vec![(12, 1.0), (20, 2.0)],
             activation_temp: 873.15,
             enthalpy_change: 802000.0,
+        },
+        Reaction {
+            reactants: vec![(2, 1.0), (0, 3.0)],
+            products: vec![(17, 2.0)],
+            activation_temp: 673.15,
+            enthalpy_change: 92400.0,
+        },
+        Reaction {
+            reactants: vec![(11, 2.0), (3, 1.0)],
+            products: vec![(12, 2.0)],
+            activation_temp: 880.0,
+            enthalpy_change: 566000.0,
+        },
+        Reaction {
+            reactants: vec![(14, 2.0), (3, 7.0)],
+            products: vec![(12, 4.0), (20, 6.0)],
+            activation_temp: 800.0,
+            enthalpy_change: 3120000.0,
+        },
+        Reaction {
+            reactants: vec![(17, 4.0), (3, 3.0)],
+            products: vec![(2, 2.0), (20, 6.0)],
+            activation_temp: 1073.15,
+            enthalpy_change: 1267000.0,
+        },
+        Reaction {
+            reactants: vec![(15, 1.0), (3, 5.0)],
+            products: vec![(12, 3.0), (20, 4.0)],
+            activation_temp: 743.15,
+            enthalpy_change: 2220000.0,
+        },
+        Reaction {
+            reactants: vec![(16, 2.0), (3, 13.0)],
+            products: vec![(12, 8.0), (20, 10.0)],
+            activation_temp: 678.15,
+            enthalpy_change: 5756000.0,
+        },
+        Reaction {
+            reactants: vec![(21, 1.0), (3, 3.0)],
+            products: vec![(12, 2.0), (20, 3.0)],
+            activation_temp: 638.15,
+            enthalpy_change: 1367000.0,
+        },
+        Reaction {
+            reactants: vec![(22, 2.0), (3, 3.0)],
+            products: vec![(12, 2.0), (20, 4.0)],
+            activation_temp: 738.15,
+            enthalpy_change: 1452000.0,
         }
     ]
 }
