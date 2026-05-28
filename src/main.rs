@@ -3,16 +3,16 @@ use rand::Rng;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-const R: f64 = 8.314; // Универсальная газовая постоянная
+const R: f64 = 8.314;
 
 #[derive(Clone, Debug, PartialEq)]
 struct Substance {
     name: String,
     is_gas: bool,
-    molar_mass: f64,    // кг/моль
-    boiling_point: f64, // Кельвин
-    density: f64,       // кг/м^3
-    heat_capacity: f64, // Дж/(кг*К)
+    molar_mass: f64,
+    boiling_point: f64,
+    density: f64,
+    heat_capacity: f64,
 }
 
 struct Particle {
@@ -28,21 +28,19 @@ struct SpawnedEntity {
 }
 
 struct GasWorksApp {
-    // Термодинамика системы
     temperature: f64,
     volume: f64,
     ambient_pressure: f64,
 
-    // База данных и состояние
+
     database: Vec<Substance>,
     entities: Vec<SpawnedEntity>,
     particles: Vec<Particle>,
 
-    // Инструменты спавна
+
     spawn_amount_moles: f64,
     selected_substance: usize,
 
-    // Триггер искры для поджигания реакций вручную
     spark_trigger: bool,
 }
 
@@ -56,7 +54,7 @@ impl Default for GasWorksApp {
             entities: Vec::new(),
             particles: Vec::new(),
             spawn_amount_moles: 2.0,
-            selected_substance: 0, // По умолчанию Водород
+            selected_substance: 0,
             spark_trigger: false,
         }
     }
@@ -64,13 +62,12 @@ impl Default for GasWorksApp {
 
 impl eframe::App for GasWorksApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let dt = ctx.input(|i| i.stable_dt).min(0.03); // Ограничиваем шаг физики
+        let dt = ctx.input(|i| i.stable_dt).min(0.03);
 
-        // Вызов физического и химического движков
         self.update_physics(dt);
         self.check_chemical_reactions();
 
-        // Отрисовка интерфейса
+
         self.window_settings(ctx);
         self.window_formulas_and_stats(ctx);
         self.window_spawner(ctx);
@@ -90,7 +87,7 @@ impl GasWorksApp {
             let is_currently_gas = sub.is_gas || self.temperature >= sub.boiling_point;
 
             if is_currently_gas {
-                // Скорость по МКТ: v = sqrt(3RT/M)
+
                 let v_rms = ((3.0 * R * self.temperature) / sub.molar_mass).sqrt();
                 let speed_scale = (v_rms * 0.0005) as f32; // Коэффициент адаптации под пиксели
 
@@ -101,7 +98,7 @@ impl GasWorksApp {
                 if particle.pos.y <= 0.0 { particle.pos.y = 0.0; particle.dir.y *= -1.0; }
                 if particle.pos.y >= 1.0 { particle.pos.y = 1.0; particle.dir.y *= -1.0; }
             } else {
-                // Жидкость стекает вниз
+
                 particle.pos.y += 0.3 * dt;
                 if particle.pos.y > 0.96 {
                     particle.pos.y = rng.gen_range(0.94..=0.98);
@@ -112,9 +109,8 @@ impl GasWorksApp {
         }
     }
 
-    // Химический движок реального времени
+
     fn check_chemical_reactions(&mut self) {
-        // Индексы веществ в нашей БД: 0 - Водород (H2), 3 - Кислород (O2), 20 - Вода (H2O)
         let h2_idx = 0;
         let o2_idx = 3;
         let h2o_idx = 20;
@@ -127,33 +123,28 @@ impl GasWorksApp {
             if entity.substance_idx == o2_idx { o2_moles += entity.moles; }
         }
 
-        // Условие реакции: Температура > 773К (500°C) ИЛИ нажата кнопка "Искры"
         let thermal_activation = self.temperature >= 773.15;
         if (thermal_activation || self.spark_trigger) && h2_moles > 0.01 && o2_moles > 0.01 {
 
-            // Расчет лимитирующего реагента по стехиометрии (2 H2 + 1 O2 -> 2 H2O)
             let limit_by_h2 = h2_moles / 2.0;
-            let reaction_cycles = limit_by_h2.min(o2_moles).min(0.1); // ограничиваем скорость реакции за тик
+            let reaction_cycles = limit_by_h2.min(o2_moles).min(0.1);
 
             let h2_consumed = reaction_cycles * 2.0;
             let o2_consumed = reaction_cycles;
             let h2o_produced = reaction_cycles * 2.0;
 
-            // Обновляем моли в термодинамической системе
             self.consume_substance(h2_idx, h2_consumed);
             self.consume_substance(o2_idx, o2_consumed);
             self.add_substance_moles(h2o_idx, h2o_produced);
 
-            // Реакция горения экзотермическая! Выделяется ~241.8 кДж энергии на моль H2O
             let energy_released = h2o_produced * 241800.0;
 
-            // Нагрев системы: dT = Q / (m * c). Упрощенно повышаем температуру среды:
             self.temperature += energy_released * 0.005;
 
-            // Обновляем графические частицы: превращаем H2 и O2 в H2O
+
             self.convert_particles(h2_idx, o2_idx, h2o_idx, h2o_produced);
         }
-        self.spark_trigger = false; // Сбрасываем триггер искры
+        self.spark_trigger = false;
     }
 
     fn consume_substance(&mut self, idx: usize, amount: f64) {
@@ -176,7 +167,6 @@ impl GasWorksApp {
         let mut rng = rand::thread_rng();
         let particles_to_spawn = (moles_produced * 25.0) as usize;
 
-        // Удаляем часть старых частиц реагентов
         let mut removed = 0;
         self.particles.retain(|p| {
             if (p.substance_idx == r1 || p.substance_idx == r2) && removed < particles_to_spawn {
@@ -187,7 +177,6 @@ impl GasWorksApp {
             }
         });
 
-        // Спавним новые частицы продукта реакции
         for _ in 0..particles_to_spawn {
             let angle = rng.gen_range(0.0..std::f32::consts::TAU);
             self.particles.push(Particle {
@@ -198,11 +187,9 @@ impl GasWorksApp {
         }
     }
 
-    // Окно 5: Контейнер и СИСТЕМА ПРЕДУПРЕЖДЕНИЙ
     fn window_viewport(&mut self, ctx: &egui::Context) {
         egui::Window::new("5. Камера симуляции").show(ctx, |ui| {
 
-            // Расчет текущего давления для панели алармов
             let mut total_moles_gas = 0.0;
             for entity in &self.entities {
                 if self.database[entity.substance_idx].is_gas || self.temperature >= self.database[entity.substance_idx].boiling_point {
@@ -211,7 +198,6 @@ impl GasWorksApp {
             }
             let current_pressure = (total_moles_gas * R * self.temperature) / self.volume;
 
-            // --- БЛОК АТМОСФЕРНЫХ ПРЕДУПРЕЖДЕНИЙ ---
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("ДАТЧИКИ БЕЗОПАСНОСТИ:");
@@ -224,7 +210,7 @@ impl GasWorksApp {
                     }
 
                     if self.temperature > 1500.0 {
-                        ui.colored_label(egui::Color32::RED, "🔥 РАСПЛАВЛЕНИЕ СТЕНКА СРЕДЫ!");
+                        ui.colored_label(egui::Color32::RED, "РАСПЛАВЛЕНИЕ СТЕНКА СРЕДЫ!");
                     } else if self.temperature > 773.15 {
                         ui.colored_label(egui::Color32::LIGHT_RED, "✴ Среда раскалена (Самовоспламенение газов)");
                     }
@@ -232,7 +218,6 @@ impl GasWorksApp {
             });
             ui.add_space(5.0);
 
-            // Отрисовка графического окна контейнера
             let (response, painter) = ui.allocate_painter(egui::vec2(450.0, 400.0), egui::Sense::hover());
             let rect = response.rect;
 
@@ -259,8 +244,8 @@ impl GasWorksApp {
             ui.separator();
             ui.heading("Твики и быстрое управление:");
             ui.horizontal(|ui| {
-                if ui.button("❄ Охладить до 0°C").clicked() { self.temperature = 273.15; }
-                if ui.button("💥 Дать искру (Поджег)").clicked() { self.spark_trigger = true; }
+                if ui.button("Охладить до 0°C").clicked() { self.temperature = 273.15; }
+                if ui.button("Дать искру (Поджег)").clicked() { self.spark_trigger = true; }
             });
         });
     }
@@ -317,11 +302,11 @@ impl GasWorksApp {
             ui.separator();
             ui.heading("Инструменты очистки поля:");
             ui.horizontal(|ui| {
-                if ui.button("🧹 Очистить ВСЁ").clicked() {
+                if ui.button("Очистить ВСЁ").clicked() {
                     self.entities.clear();
                     self.particles.clear();
                 }
-                if ui.button("💧 Удалить жидкости").clicked() {
+                if ui.button("Удалить жидкости").clicked() {
                     let db = &self.database;
                     let t = self.temperature;
                     self.particles.retain(|p| db[p.substance_idx].is_gas || t >= db[p.substance_idx].boiling_point);
@@ -356,7 +341,6 @@ fn get_substance_color(name: &str) -> egui::Color32 {
 
 fn build_substance_database() -> Vec<Substance> {
     vec![
-        // === ГАЗЫ (20) ===
         Substance { name: "Водород (H2)".into(), is_gas: true, molar_mass: 0.002016, boiling_point: 20.28, density: 0.08988, heat_capacity: 14300.0 },
         Substance { name: "Гелий (He)".into(), is_gas: true, molar_mass: 0.004002, boiling_point: 4.22, density: 0.1786, heat_capacity: 5193.0 },
         Substance { name: "Азот (N2)".into(), is_gas: true, molar_mass: 0.02801, boiling_point: 77.36, density: 1.2506, heat_capacity: 1040.0 },
@@ -378,7 +362,6 @@ fn build_substance_database() -> Vec<Substance> {
         Substance { name: "Диоксид серы (SO2)".into(), is_gas: true, molar_mass: 0.06406, boiling_point: 263.1, density: 2.926, heat_capacity: 620.0 },
         Substance { name: "Диоксид азота (NO2)".into(), is_gas: true, molar_mass: 0.04601, boiling_point: 294.3, density: 1.88, heat_capacity: 810.0 },
 
-        // === ЖИДКОСТИ (10) ===
         Substance { name: "Вода (H2O)".into(), is_gas: false, molar_mass: 0.01801, boiling_point: 373.15, density: 997.0, heat_capacity: 4184.0 },
         Substance { name: "Этанол (C2H5OH)".into(), is_gas: false, molar_mass: 0.04607, boiling_point: 351.39, density: 789.0, heat_capacity: 2440.0 },
         Substance { name: "Метанол (CH3OH)".into(), is_gas: false, molar_mass: 0.03204, boiling_point: 337.8, density: 792.0, heat_capacity: 2530.0 },
